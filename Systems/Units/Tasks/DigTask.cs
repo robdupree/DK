@@ -60,6 +60,9 @@ namespace DK.Tasks
 
             ai.StopTaskRotation();
 
+            // NEUE SEKTION: AGGRESSIVE ANIMATION-BEREINIGUNG
+            ForceStopAllIdleAnimations(ai);
+
             // Animator sofort zurücksetzen
             if (ai.animator != null)
             {
@@ -121,6 +124,76 @@ namespace DK.Tasks
                 TaskManager.Instance.CompleteTask(dataTask);
                 return;
             }
+        }
+
+        private void ForceStopAllIdleAnimations(UnitAI ai)
+        {
+            if (ai.animator == null) return;
+
+            Debug.Log($"[{ai.name}] FORCE-STOP aller Idle-Animationen für Dig-Task");
+
+            // 1. Alle bekannten Idle-Parameter aggressiv deaktivieren
+            string[] commonIdleParams = {
+        "Idle1", "Idle2", "Idle3", "IdleLookAround",
+        "IdleStretch", "IdleBored", "IsIdle", "IdleIndex"
+    };
+
+            foreach (string param in commonIdleParams)
+            {
+                if (HasAnimatorParameter(ai.animator, param, AnimatorControllerParameterType.Bool))
+                {
+                    ai.animator.SetBool(param, false);
+                }
+                else if (HasAnimatorParameter(ai.animator, param, AnimatorControllerParameterType.Int))
+                {
+                    ai.animator.SetInteger(param, 0);
+                }
+            }
+
+            // 2. Konfigurierte Idle-Animationen deaktivieren
+            if (ai.availableIdleAnimations != null)
+            {
+                foreach (string idleAnim in ai.availableIdleAnimations)
+                {
+                    if (HasAnimatorParameter(ai.animator, idleAnim, AnimatorControllerParameterType.Bool))
+                    {
+                        ai.animator.SetBool(idleAnim, false);
+                    }
+                }
+            }
+
+            // 3. Speed explizit setzen
+            ai.animator.SetFloat("Speed", 0f);
+
+            // 4. MEHRFACH-UPDATE: Forciere sofortige Anwendung
+            ai.animator.Update(0f);
+            ai.animator.Update(0.01f);  // Zwei Updates um sicherzustellen
+
+            // 5. Zusätzlich: Play direkt zum Base State wenn möglich
+            try
+            {
+                ai.animator.Play("Idle", 0, 0f); // Spiele Standard-Idle ab
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogWarning($"[{ai.name}] Konnte nicht zu Base-Idle wechseln: {e.Message}");
+            }
+
+            Debug.Log($"[{ai.name}] Idle-Animationen FORCE-GESTOPPT");
+        }
+
+
+        private bool HasAnimatorParameter(Animator animator, string paramName, AnimatorControllerParameterType paramType)
+        {
+            if (animator == null || animator.runtimeAnimatorController == null)
+                return false;
+
+            foreach (AnimatorControllerParameter param in animator.parameters)
+            {
+                if (param.name == paramName && param.type == paramType)
+                    return true;
+            }
+            return false;
         }
 
         public bool UpdateTask(UnitAI ai)

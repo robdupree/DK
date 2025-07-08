@@ -100,7 +100,6 @@ public class DigManager : MonoBehaviour
         return true;
     }
 
-    // In DigManager.cs - erweitere die CompleteDig Methode:
     public void CompleteDig(Vector3Int pos)
     {
         if (!tileMap.TryGetValue(pos, out var tile))
@@ -122,21 +121,59 @@ public class DigManager : MonoBehaviour
             }
         }
 
+        // NEUER ZERSTÖRUNGSEFFEKT VOR der Tile-Änderung abspielen
+        if (tileController != null)
+        {
+            // Verwende die neue Methode mit Tile-Daten für kontextspezifische Effekte
+            tileController.PlayDestructionEffectForTileData(pos, tile);
+        }
+
+        // Tile-State ändern
         tile.State = TileState.Floor_Neutral;
 
+        // Tile visuell ersetzen (NACH dem Effekt für besseres Timing)
         if (neutralFloorTile != null)
             tileController.tilemap.SetTile(pos, neutralFloorTile);
         else
             tileController.ReplaceWallWithFloor(pos);
 
+        // Cleanup
         tile.ReleaseAllSlots();
         tile.AssignedWorkers.Clear();
 
         selectionManager?.RemoveHighlightAt(pos);
         FindFirstObjectByType<DigReactionSystem>()?.OnTileDug(pos);
 
-        // NEUE ZEILE: Warte einen Frame bevor Adjacent-Tasks erstellt werden
+        // Warte einen Frame bevor Adjacent-Tasks erstellt werden
         StartCoroutine(DelayedAdjacentTaskCreation(pos));
+        StartCoroutine(DelayedTaskAssignment(0.5f));
+    }
+
+    private System.Collections.IEnumerator DelayedTaskAssignment(float delay)
+    {
+        yield return new WaitForSeconds(delay);
+
+        TaskAssigner taskAssigner = FindObjectOfType<TaskAssigner>();
+        if (taskAssigner != null)
+        {
+            taskAssigner.TriggerImmediateAssignment();
+        }
+    }
+
+    [ContextMenu("Test Destruction Effect at (0,0,0)")]
+    public void TestDestructionEffectAtOrigin()
+    {
+        Vector3Int testPos = Vector3Int.zero;
+        if (tileMap.TryGetValue(testPos, out var tile))
+        {
+            tileController?.PlayDestructionEffectForTileData(testPos, tile);
+        }
+        else
+        {
+            // Erstelle Test-Tile-Daten
+            var testTileData = new DungeonTileData(TileState.Wall_Intact, testPos);
+            tileController?.PlayDestructionEffectForTileData(testPos, testTileData);
+        }
     }
 
     // NEUE METHODE: Bereinige Tasks für spezifische Position

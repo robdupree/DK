@@ -42,22 +42,92 @@ namespace DK
         [Tooltip("Zeit zwischen Ausweichmanövern")]
         public float avoidanceCooldown = 0.5f;
         [Tooltip("Zeit nach der ein Imp als 'stuck' gilt")]
-        public float stuckTimeThreshold = 5.0f; // Erhöht von 3.0f
+        public float stuckTimeThreshold = 5.0f;
         [Tooltip("Distanz die als 'bewegungslos' gilt")]
-        public float stuckDistanceThreshold = 0.05f; // Reduziert von 0.1f
+        public float stuckDistanceThreshold = 0.05f;
         [Tooltip("Wie weich/träge die Bewegung ist (höher = weicher)")]
         public float movementSmoothing = 0.3f;
 
+        [Header("Animation Settings")]
+        [Tooltip("Name der Dig-Animation im Animator")]
+        public string digAnimationName = "dig";
+        [Tooltip("Basis-Länge der Dig-Animation in Sekunden (wird durch Animator Speed geteilt)")]
+        public float digAnimationBaseLength = 1.0f;
+
+        [Header("Wander Behavior")]
+        [Tooltip("Automatisches Wanderverhalten wenn idle")]
+        public bool enableWanderBehavior = true;
+
+        [Header("Wander Settings")]
+        [Tooltip("Maximale Distanz für Wanderungen")]
+        public float maxWanderDistance = 10f;
+        [Tooltip("Minimale Distanz für Wanderungen")]
+        public float minWanderDistance = 3f;
+        [Tooltip("Wahrscheinlichkeit pro Sekunde dass der Imp zu wandern beginnt (0-1)")]
+        [Range(0f, 1f)]
+        public float wanderProbability = 0.1f;
+        [Tooltip("Wahrscheinlichkeit pro Sekunde dass der Imp aufhört zu wandern (0-1)")]
+        [Range(0f, 1f)]
+        public float stopWanderProbability = 0.3f;
+
+        [Header("Idle Settings")]
+        [Tooltip("Minimale Idle-Zeit in Sekunden")]
+        public float minIdleTime = 2f;
+        [Tooltip("Maximale Idle-Zeit in Sekunden")]
+        public float maxIdleTime = 8f;
+        [Tooltip("Wahrscheinlichkeit dass Imp idlet statt wandert (0-1)")]
+        [Range(0f, 1f)]
+        public float idleProbability = 0.4f;
+
+        [Header("Wander Zones")]
+        [Tooltip("Nur in gegrabenen Bereichen wandern")]
+        public bool onlyWanderInDugAreas = true;
+        [Tooltip("Auch in eroberten Bereichen wandern")]
+        public bool includeConqueredAreas = true;
+
+        [Header("Debug")]
+        [Tooltip("Zeigt Wanderradius und Ziele an")]
+        public bool showDebugGizmos = false;
+        [Tooltip("Detaillierte Logs für Wanderverhalten")]
+        public bool enableDetailedWanderLogging = false;
+
+
+        [Header("Idle Animation Settings")]
+        [Tooltip("Liste der verfügbaren Idle-Animationen (Trigger oder Bool Parameter)")]
+        public string[] availableIdleAnimations = {
+    "Idle1",
+    "Idle2",
+    "Idle3",
+    "IdleLookAround",
+    "IdleStretch",
+    "IdleBored"
+};
+
+        [Tooltip("Minimale Zeit zwischen Animationswechseln")]
+        public float minAnimationSwitchTime = 1.5f;
+
+        [Tooltip("Maximale Zeit zwischen Animationswechseln")]
+        public float maxAnimationSwitchTime = 5f;
+
+        [Tooltip("Verhindert die gleiche Animation zweimal hintereinander")]
+        public bool preventSameAnimationTwice = true;
+
+        [Tooltip("Bevorzuge bestimmte Animationen (höhere Werte = häufiger)")]
+        public float[] animationWeights = { 1f, 1f, 1f, 1f, 1f, 1f };
+
+        [Tooltip("Debug-Logs für Idle-Animationen")]
+        public bool debugIdleAnimations = false;
+
         private NavMeshAgent agent;
         private ITask currentTask;
-        private readonly Queue<ITask> highPriority = new();
-        private readonly Queue<ITask> normalPriority = new();
+        [HideInInspector] public readonly Queue<ITask> highPriority = new();
+        [HideInInspector] public readonly Queue<ITask> normalPriority = new();
         private readonly Queue<ITask> lowPriority = new();
 
-        [HideInInspector] public Animator animator; // Öffentlich für Tasks
-        private Quaternion originalMeshRotation; // Ursprüngliche Mesh-Rotation speichern
-        private Vector3? targetLookDirection; // Zielrichtung für Tasks
-        [HideInInspector] public bool isTaskRotating = false; // Öffentlich für Debug
+        [HideInInspector] public Animator animator;
+        private Quaternion originalMeshRotation;
+        private Vector3? targetLookDirection;
+        [HideInInspector] public bool isTaskRotating = false;
         private float lastAvoidanceTime = 0f;
 
         // Stuck-Detection Variablen
@@ -71,12 +141,31 @@ namespace DK
         private Vector3 targetPosition;
         private bool hasValidTarget = false;
 
-        [Header("Animation Settings")]
-        [Tooltip("Name der Dig-Animation im Animator")]
-        public string digAnimationName = "dig";
+        // Wander Behavior - Interne Variablen
+        private Vector3 homePosition;
+        private bool isWandering = false;
+        private float lastBehaviorChange = 0f;
+        private Vector3? currentWanderTarget = null;
+        private const float BEHAVIOR_CHECK_INTERVAL = 1f;
 
-        [Tooltip("Basis-Länge der Dig-Animation in Sekunden (wird durch Animator Speed geteilt)")]
-        public float digAnimationBaseLength = 1.0f;
+
+        [Header("Root Motion & Animation")]
+        [Tooltip("Aktiviert Root Motion für Idle-Animationen")]
+        public bool useRootMotionForIdle = true;
+
+        [Tooltip("Position-Lock während Idle-Animationen")]
+        public bool lockPositionDuringIdle = true;
+
+        [Tooltip("Maximale erlaubte Bewegung während Idle (in Metern)")]
+        public float maxIdleMovement = 0.1f;
+
+        // Root Motion Kontrolle
+        private Vector3 idleStartPosition;
+        private bool isInIdleState = false;
+        private bool wasApplyingRootMotion = false;
+
+        public NavMeshAgent Agent => agent;
+
 
         void Awake()
         {
@@ -94,7 +183,7 @@ namespace DK
 
             // Mesh-Transform automatisch finden, falls nicht zugewiesen
             if (meshTransform == null)
-                meshTransform = transform.GetChild(0); // Nimmt das erste Child
+                meshTransform = transform.GetChild(0);
 
             // Ursprüngliche Mesh-Rotation speichern
             if (meshTransform != null)
@@ -104,33 +193,20 @@ namespace DK
             lastPosition = transform.position;
 
             // NavMeshAgent für weichere Bewegung konfigurieren
-            agent.acceleration = 8f; // Reduziert von Standard 8f
-            agent.angularSpeed = 120f; // Reduziert von Standard 120f für weichere Drehungen
+            agent.acceleration = 8f;
+            agent.angularSpeed = 120f;
+
+            // Wander Behavior initialisieren
+            homePosition = transform.position;
+            lastBehaviorChange = Time.time;
         }
 
-        // ÄNDERUNGEN für UnitAI.cs Update() Methode
-        // Füge diese Änderungen in deine UnitAI.cs ein:
-
-        // KRITISCHE ÄNDERUNG in UnitAI.cs Update() Methode:
-        // Entferne diese Zeilen aus der Update() Methode:
-
-        /*
-        // DIESE ZEILEN LÖSCHEN/AUSKOMMENTIEREN:
-        if (animator != null)
-        {
-            animator.SetBool("IsDigging", false);
-            Debug.Log($"[{name}] Dig-Animation sicherheitshalber zurückgesetzt");
-        }
-        */
-
-        // Die neue Update() Methode sollte so aussehen:
-
-        // In UnitAI.cs Update() Methode ändern:
         void Update()
         {
-            float speed = agent.velocity.magnitude;
-            animator.SetFloat("Speed", speed);
+            float agentSpeed = agent.velocity.magnitude;
+            animator.SetFloat("Speed", agentSpeed);
 
+            HandleIdlePositionLock();
             HandleStuckDetection();
             HandleCollisionAvoidance();
 
@@ -145,11 +221,37 @@ namespace DK
 
             HandleRotation();
 
-            // SOFORTIGE Task-Aufnahme wenn Idle
-            if (currentTask is IdleTask && (highPriority.Count > 0 || normalPriority.Count > 0))
+            // ERWEITERTE Task-Unterbrechungslogik
+            if (currentTask is IdleTask || currentTask is WanderTask)
             {
-                currentTask.OnExit(this);
-                currentTask = null;
+                if (highPriority.Count > 0 || normalPriority.Count > 0)
+                {
+                    Debug.Log($"[{name}] Unterbreche {currentTask.GetType().Name} für wichtigere Task");
+
+                    // WICHTIG: Animator-Cleanup vor Task-Wechsel
+                    if (currentTask is IdleTask && animator != null)
+                    {
+                        // Alle Idle-Animationen sofort stoppen
+                        animator.SetFloat("Speed", 0f);
+                        foreach (string idleAnim in availableIdleAnimations)
+                        {
+                            if (HasAnimatorBoolParameter(idleAnim))
+                            {
+                                animator.SetBool(idleAnim, false);
+                            }
+                        }
+                        animator.Update(0f); // Forciere sofortiges Update
+                    }
+
+                    currentTask.OnExit(this);
+                    currentTask = null;
+
+                    // Stoppe Wanderverhalten
+                    if (isWandering)
+                    {
+                        StopWandering();
+                    }
+                }
             }
 
             // SOFORTIGE neue Task-Zuweisung
@@ -158,7 +260,6 @@ namespace DK
                 if (highPriority.Count > 0) StartNext(highPriority);
                 else if (normalPriority.Count > 0) StartNext(normalPriority);
                 else if (lowPriority.Count > 0) StartNext(lowPriority);
-                // WICHTIG: Kein IdleTask mehr - TaskAssigner kann sofort zuweisen
             }
 
             if (currentTask != null && currentTask.UpdateTask(this))
@@ -166,11 +267,373 @@ namespace DK
                 Debug.Log($"[{name}] Task beendet: {currentTask.GetType().Name}");
                 currentTask.OnExit(this);
                 currentTask = null;
-                // SOFORT verfügbar für neue Tasks
+            }
+
+            // Wanderverhalten nur wenn aktiviert und verfügbar
+            if (enableWanderBehavior && IsAvailable())
+            {
+                HandleWanderBehavior();
             }
         }
 
-        // Neue Hilfsmethode für Debug-Zwecke
+        private bool HasAnimatorBoolParameter(string paramName)
+        {
+            if (animator == null || animator.runtimeAnimatorController == null)
+                return false;
+
+            foreach (AnimatorControllerParameter param in animator.parameters)
+            {
+                if (param.name == paramName && param.type == AnimatorControllerParameterType.Bool)
+                    return true;
+            }
+            return false;
+        }
+
+        private bool IsPerformingCriticalWork()
+        {
+            if (currentTask == null) return false;
+
+            // DigTask in verschiedenen Phasen
+            if (currentTask is DigTask)
+            {
+                // Während DigTask NIE stuck detection oder avoidance
+                return true;
+            }
+
+            // ConquerTask
+            if (currentTask is ConquerTask)
+            {
+                return true;
+            }
+
+            // Weitere kritische Tasks hier hinzufügen...
+
+            return false;
+        }
+
+
+        private void HandleIdlePositionLock()
+        {
+            bool currentlyIdle = (currentTask is IdleTask);
+
+            // Idle-Zustand geändert
+            if (currentlyIdle != isInIdleState)
+            {
+                if (currentlyIdle)
+                {
+                    StartIdleState();
+                }
+                else
+                {
+                    EndIdleState();
+                }
+                isInIdleState = currentlyIdle;
+            }
+
+            // Während Idle: Position kontrollieren
+            if (isInIdleState && lockPositionDuringIdle)
+            {
+                LockIdlePosition();
+            }
+        }
+
+        private void StartIdleState()
+        {
+            idleStartPosition = transform.position;
+
+            if (useRootMotionForIdle && animator != null)
+            {
+                wasApplyingRootMotion = agent.updatePosition;
+                agent.updatePosition = false; // NavMeshAgent soll Position nicht überschreiben
+                animator.applyRootMotion = true;
+
+                Debug.Log($"[{name}] Idle-Modus: Root Motion aktiviert, Position gelockt bei {idleStartPosition}");
+            }
+            else
+            {
+                // Klassischer Approach: Komplett statisch
+                if (agent != null)
+                {
+                    agent.isStopped = true;
+                    agent.velocity = Vector3.zero;
+                }
+            }
+        }
+
+        private void EndIdleState()
+        {
+            if (useRootMotionForIdle && animator != null)
+            {
+                agent.updatePosition = wasApplyingRootMotion;
+                animator.applyRootMotion = false;
+
+                // Stelle sicher dass Agent an aktueller Position ist
+                if (agent.isOnNavMesh)
+                {
+                    agent.Warp(transform.position);
+                }
+
+                Debug.Log($"[{name}] Idle-Modus beendet: Root Motion deaktiviert");
+            }
+            else
+            {
+                if (agent != null)
+                {
+                    agent.isStopped = false;
+
+                    // Warp zu aktueller Position um Synchronisation sicherzustellen
+                    if (agent.isOnNavMesh)
+                    {
+                        agent.Warp(transform.position);
+                    }
+                }
+            }
+        }
+
+        private void LockIdlePosition()
+        {
+            Vector3 currentPos = transform.position;
+            float driftDistance = Vector3.Distance(currentPos, idleStartPosition);
+
+            // Erlaube kleine Bewegungen (Foot IK), aber verhindere großes Driften
+            if (driftDistance > maxIdleMovement)
+            {
+                Vector3 correctedPosition = idleStartPosition +
+                    (currentPos - idleStartPosition).normalized * maxIdleMovement;
+
+                correctedPosition.y = currentPos.y; // Y-Position von Animation übernehmen (wichtig für Foot IK)
+
+                transform.position = correctedPosition;
+
+                if (debugIdleAnimations)
+                {
+                    Debug.Log($"[{name}] Position korrigiert: Drift {driftDistance:F3}m → {maxIdleMovement:F3}m");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Unity's OnAnimatorMove - wird für Root Motion aufgerufen
+        /// </summary>
+        void OnAnimatorMove()
+        {
+            if (!useRootMotionForIdle || !isInIdleState)
+                return;
+
+            // Root Motion nur für Y-Achse (Foot IK) anwenden, XZ blockieren
+            if (animator != null)
+            {
+                Vector3 rootMotionDelta = animator.deltaPosition;
+                Vector3 newPosition = transform.position;
+
+                // Nur Y-Bewegung erlauben (für Foot IK / Gewichtsverlagerung)
+                newPosition.y += rootMotionDelta.y;
+
+                // XZ-Bewegung begrenzen
+                Vector3 xzOffset = new Vector3(rootMotionDelta.x, 0, rootMotionDelta.z);
+                if (xzOffset.magnitude < maxIdleMovement)
+                {
+                    newPosition.x += rootMotionDelta.x;
+                    newPosition.z += rootMotionDelta.z;
+                }
+
+                transform.position = newPosition;
+
+                // Rotation von Root Motion übernehmen (für Look-Around Animationen)
+                if (!isTaskRotating) // Nur wenn keine Task-Rotation aktiv
+                {
+                    transform.rotation *= animator.deltaRotation;
+                }
+            }
+        }
+
+        private void HandleWanderBehavior()
+        {
+            // Behavior-Changes nur alle BEHAVIOR_CHECK_INTERVAL Sekunden prüfen
+            if (Time.time - lastBehaviorChange < BEHAVIOR_CHECK_INTERVAL)
+                return;
+
+            // Entscheide was der Imp als nächstes tun soll
+            DecideNextBehavior();
+            lastBehaviorChange = Time.time;
+        }
+
+        private void DecideNextBehavior()
+        {
+            if (isWandering)
+            {
+                // Prüfe ob Imp am Wanderziel angekommen ist oder wandern stoppen soll
+                if (HasReachedWanderTarget() || ShouldStopWandering())
+                {
+                    StopWandering();
+
+                    // Nach dem Wandern oft eine Idle-Pause einlegen
+                    if (Random.value < 0.7f)
+                    {
+                        StartIdling();
+                    }
+                }
+            }
+            else
+            {
+                // Imp idlet gerade - entscheide ob wandern oder weiter idlen
+                if (ShouldStartWandering())
+                {
+                    StartWandering();
+                }
+            }
+        }
+
+        private bool ShouldStartWandering()
+        {
+            // Basis-Wahrscheinlichkeit für Wandern
+            float baseChance = wanderProbability * BEHAVIOR_CHECK_INTERVAL;
+
+            // Modifikationen basierend auf Situation
+            float timeSinceLastChange = Time.time - lastBehaviorChange;
+
+            // Nach längerem Idle erhöhte Wanderlust
+            if (timeSinceLastChange > 5f)
+            {
+                baseChance *= 2f;
+            }
+
+            // Weniger wandern wenn Imp weit von Heimat entfernt
+            float distanceFromHome = Vector3.Distance(transform.position, homePosition);
+            if (distanceFromHome > maxWanderDistance * 0.8f)
+            {
+                baseChance *= 0.3f;
+            }
+
+            return Random.value < baseChance;
+        }
+
+        private bool ShouldStopWandering()
+        {
+            float stopChance = stopWanderProbability * BEHAVIOR_CHECK_INTERVAL;
+            return Random.value < stopChance;
+        }
+
+        private void StartWandering()
+        {
+            Vector3? wanderTarget = FindWanderTarget();
+
+            if (wanderTarget.HasValue)
+            {
+                isWandering = true;
+                currentWanderTarget = wanderTarget.Value;
+
+                // Wander-Task mit niedriger Priorität hinzufügen
+                var wanderTask = new WanderTask(currentWanderTarget.Value);
+                EnqueueTask(wanderTask, TaskPriority.Low);
+
+                if (enableDetailedWanderLogging)
+                {
+                    Debug.Log($"[WanderBehavior] {name} beginnt zu wandern nach {currentWanderTarget.Value}");
+                }
+            }
+            else
+            {
+                // Kein gültiges Wanderziel gefunden - idle stattdessen
+                StartIdling();
+            }
+        }
+
+        private void StopWandering()
+        {
+            isWandering = false;
+            currentWanderTarget = null;
+
+            if (enableDetailedWanderLogging)
+            {
+                Debug.Log($"[WanderBehavior] {name} stoppt das Wandern");
+            }
+        }
+
+        private void StartIdling()
+        {
+            float idleDuration = Random.Range(minIdleTime, maxIdleTime);
+            var idleTask = CreateConfiguredIdleTask(idleDuration);
+            EnqueueTask(idleTask, TaskPriority.Low);
+
+            if (enableDetailedWanderLogging)
+            {
+                Debug.Log($"[WanderBehavior] {name} idlet für {idleDuration:F1}s mit konfigurierten Animationen");
+            }
+        }
+
+        private bool HasReachedWanderTarget()
+        {
+            if (!currentWanderTarget.HasValue)
+                return true;
+
+            float distanceToTarget = Vector3.Distance(transform.position, currentWanderTarget.Value);
+            return distanceToTarget < 1.5f;
+        }
+
+        private Vector3? FindWanderTarget()
+        {
+            int maxAttempts = 20;
+
+            for (int attempt = 0; attempt < maxAttempts; attempt++)
+            {
+                // Zufällige Richtung und Distanz
+                float angle = Random.Range(0f, 360f) * Mathf.Deg2Rad;
+                float distance = Random.Range(minWanderDistance, maxWanderDistance);
+
+                Vector3 randomDirection = new Vector3(
+                    Mathf.Cos(angle) * distance,
+                    0f,
+                    Mathf.Sin(angle) * distance
+                );
+
+                Vector3 potentialTarget = homePosition + randomDirection;
+
+                // Prüfe ob Position auf NavMesh erreichbar ist
+                if (UnityEngine.AI.NavMesh.SamplePosition(potentialTarget, out UnityEngine.AI.NavMeshHit hit, 2f, UnityEngine.AI.NavMesh.AllAreas))
+                {
+                    // Prüfe ob Position in erlaubtem Bereich liegt
+                    if (IsValidWanderLocation(hit.position))
+                    {
+                        return hit.position;
+                    }
+                }
+            }
+
+            // Fallback: Bleib in der Nähe der aktuellen Position
+            Vector3 nearbyTarget = transform.position + Random.insideUnitSphere * 2f;
+            nearbyTarget.y = transform.position.y;
+
+            if (UnityEngine.AI.NavMesh.SamplePosition(nearbyTarget, out UnityEngine.AI.NavMeshHit nearHit, 3f, UnityEngine.AI.NavMesh.AllAreas))
+            {
+                return nearHit.position;
+            }
+
+            return null;
+        }
+
+        private bool IsValidWanderLocation(Vector3 worldPosition)
+        {
+            if (!onlyWanderInDugAreas)
+                return true;
+
+            // Konvertiere zu Tile-Position
+            Vector3Int tilePos = Vector3Int.FloorToInt(worldPosition);
+
+            if (DigManager.Instance?.tileMap?.TryGetValue(tilePos, out var tileData) == true)
+            {
+                return tileData.State == TileState.Floor_Dug ||
+                       tileData.State == TileState.Room_Treasury ||
+                       tileData.State == TileState.Room_Lair ||
+                       tileData.State == TileState.Room_Training ||
+                       (includeConqueredAreas && tileData.State == TileState.Floor_Conquered);
+            }
+
+            // Wenn keine Tile-Daten vorhanden, erlaube Wandern (z.B. in Starträumen)
+            return true;
+        }
+
+        // Rest deiner bestehenden Methoden...
         public void DebugAnimationState()
         {
             if (animator != null)
@@ -181,15 +644,12 @@ namespace DK
             }
         }
 
-
-        // In UnitAI.cs hinzufügen (falls noch nicht vorhanden):
         public void CheckForNewTasksImmediately()
         {
             if (IsAvailable())
             {
                 Debug.Log($"[{name}] Prüfe sofort auf neue Tasks nach Tile-Completion");
 
-                // TaskAssigner triggern
                 TaskAssigner taskAssigner = FindObjectOfType<TaskAssigner>();
                 if (taskAssigner != null)
                 {
@@ -200,7 +660,16 @@ namespace DK
 
         void HandleStuckDetection()
         {
-            // Nur prüfen wenn der Imp sich bewegen sollte und nicht gerade Tasks wechselt
+            // NEUE ZEILE: Nicht ausführen während kritischer Arbeit
+            if (IsPerformingCriticalWork())
+            {
+                stuckTimer = 0f;
+                isStuck = false;
+                lastPosition = transform.position;
+                return;
+            }
+
+            // Nicht prüfen wenn der Imp sich bewegen sollte und nicht gerade Tasks wechselt
             if (!agent.hasPath || isTaskRotating || !agent.enabled)
             {
                 stuckTimer = 0f;
@@ -209,10 +678,9 @@ namespace DK
                 return;
             }
 
-            // Prüfen ob sich der Imp bewegt hat (über längeren Zeitraum)
+            // Rest der Methode bleibt gleich...
             float distanceMoved = Vector3.Distance(transform.position, lastPosition);
 
-            // Weniger strenge Stuck-Detection
             bool isMovingSlowly = distanceMoved < stuckDistanceThreshold && agent.velocity.sqrMagnitude < 0.05f;
             bool hasDestination = agent.hasPath && !agent.pathPending;
 
@@ -230,41 +698,36 @@ namespace DK
             }
             else
             {
-                // Nur zurücksetzen wenn wirklich Bewegung stattgefunden hat
                 if (distanceMoved > stuckDistanceThreshold * 2f)
                 {
-                    stuckTimer = Mathf.Max(0f, stuckTimer - Time.deltaTime * 2f); // Langsames Abbauen
+                    stuckTimer = Mathf.Max(0f, stuckTimer - Time.deltaTime * 2f);
                     isStuck = false;
                 }
             }
 
-            // Position nur alle 0.5 Sekunden aktualisieren für weniger aggressive Detection
             if (Time.time % 0.5f < Time.deltaTime)
             {
                 lastPosition = transform.position;
             }
         }
 
+
         void EmergencyUnstuck()
         {
-            // Stoppe alle Coroutines die eventuell laufen
             StopAllCoroutines();
 
-            // Versuche zuerst sanftere Methoden
             if (TryGentleUnstuck())
             {
                 Debug.Log($"[{name}] wurde sanft entstuckt");
                 return;
             }
 
-            // Falls sanfte Methode fehlschlägt, verwende Teleportation als letzten Ausweg
             Debug.LogWarning($"[{name}] benötigt Emergency-Teleportation");
             TeleportUnstuck();
         }
 
         bool TryGentleUnstuck()
         {
-            // Methode 1: Versuche starkes Push-Away von anderen Imps
             Collider[] nearbyImps = Physics.OverlapSphere(transform.position, avoidanceRadius * 2f, impLayerMask);
             Vector3 pushDirection = Vector3.zero;
 
@@ -282,13 +745,11 @@ namespace DK
 
                 if (UnityEngine.AI.NavMesh.SamplePosition(targetPosition, out UnityEngine.AI.NavMeshHit hit, 2f, UnityEngine.AI.NavMesh.AllAreas))
                 {
-                    // Sanfte Bewegung über mehrere Frames
                     StartCoroutine(SmoothMoveToPosition(hit.position));
                     return true;
                 }
             }
 
-            // Methode 2: Versuche zufällige Richtung
             for (int i = 0; i < 8; i++)
             {
                 float angle = i * 45f * Mathf.Deg2Rad;
@@ -297,7 +758,6 @@ namespace DK
 
                 if (UnityEngine.AI.NavMesh.SamplePosition(testPosition, out UnityEngine.AI.NavMeshHit hit, 2f, UnityEngine.AI.NavMesh.AllAreas))
                 {
-                    // Prüfe ob Position frei von anderen Imps ist
                     if (!Physics.CheckSphere(hit.position, 0.5f, impLayerMask))
                     {
                         StartCoroutine(SmoothMoveToPosition(hit.position));
@@ -306,16 +766,15 @@ namespace DK
                 }
             }
 
-            return false; // Sanfte Methoden fehlgeschlagen
+            return false;
         }
 
         System.Collections.IEnumerator SmoothMoveToPosition(Vector3 targetPosition)
         {
             Vector3 startPosition = transform.position;
-            float moveTime = 0.5f; // Zeit für die Bewegung
+            float moveTime = 0.5f;
             float elapsed = 0f;
 
-            // NavMeshAgent temporär deaktivieren für manuelle Bewegung
             agent.enabled = false;
 
             while (elapsed < moveTime)
@@ -323,31 +782,26 @@ namespace DK
                 elapsed += Time.deltaTime;
                 float progress = elapsed / moveTime;
 
-                // Smooth interpolation
                 transform.position = Vector3.Lerp(startPosition, targetPosition, progress);
                 yield return null;
             }
 
             transform.position = targetPosition;
 
-            // NavMeshAgent wieder aktivieren
             agent.enabled = true;
 
-            // Kurz warten und dann Pfad wiederherstellen
             yield return new WaitForSeconds(0.2f);
             RestorePathAfterUnstuck();
         }
 
         void TeleportUnstuck()
         {
-            // Nur als allerletzter Ausweg - finde einen nahen freien Punkt
-            Vector3 randomDirection = Random.insideUnitSphere * 1.2f; // Reduziert von 3f auf 1.2f
+            Vector3 randomDirection = Random.insideUnitSphere * 1.2f;
             randomDirection.y = 0;
             Vector3 unstuckPosition = transform.position + randomDirection;
 
             if (UnityEngine.AI.NavMesh.SamplePosition(unstuckPosition, out UnityEngine.AI.NavMeshHit hit, 2f, UnityEngine.AI.NavMesh.AllAreas))
             {
-                // Prüfe nochmal ob Position wirklich frei ist
                 if (!Physics.CheckSphere(hit.position, 0.3f, impLayerMask))
                 {
                     agent.Warp(hit.position);
@@ -356,8 +810,7 @@ namespace DK
                 }
                 else
                 {
-                    // Position ist besetzt, versuche es nochmal mit anderer Richtung
-                    randomDirection = Random.insideUnitSphere * 0.8f; // Noch näher
+                    randomDirection = Random.insideUnitSphere * 0.8f;
                     unstuckPosition = transform.position + randomDirection;
 
                     if (UnityEngine.AI.NavMesh.SamplePosition(unstuckPosition, out UnityEngine.AI.NavMeshHit fallbackHit, 1.5f, UnityEngine.AI.NavMesh.AllAreas))
@@ -372,7 +825,6 @@ namespace DK
 
         void RestorePathAfterUnstuck()
         {
-            // Versuche ursprünglichen Pfad wiederherzustellen
             if (agent.hasPath)
             {
                 Vector3 originalDestination = agent.destination;
@@ -382,10 +834,8 @@ namespace DK
 
         System.Collections.IEnumerator RestoreNormalBehavior()
         {
-            // Kurz warten
             yield return new WaitForSeconds(0.5f);
 
-            // Pfad zur ursprünglichen Destination wiederherstellen
             if (agent.hasPath)
             {
                 Vector3 originalDestination = agent.destination;
@@ -396,15 +846,18 @@ namespace DK
 
         void HandleCollisionAvoidance()
         {
-            // Nicht ausführen wenn gerade Emergency-Unstuck aktiv ist
-            if (isStuck || Time.time - lastUnstuckTime < 2f) // Längere Pause nach Unstuck
+            // NEUE ZEILE: Nicht ausführen während kritischer Arbeit
+            if (IsPerformingCriticalWork())
+            {
                 return;
+            }
 
-            // Weniger aggressive Kollisionsvermeidung
+            // Nicht ausführen wenn gerade Emergency-Unstuck aktiv ist
+            if (isStuck || Time.time - lastUnstuckTime < 2f)
+                return;
             if (agent.velocity.sqrMagnitude < 0.05f || Time.time - lastAvoidanceTime < avoidanceCooldown * 1.5f)
                 return;
 
-            // Andere Imps in der Nähe finden
             Collider[] nearbyImps = Physics.OverlapSphere(transform.position, avoidanceRadius * 0.8f, impLayerMask);
 
             Vector3 avoidanceDirection = Vector3.zero;
@@ -417,14 +870,12 @@ namespace DK
                 UnitAI otherImp = collider.GetComponent<UnitAI>();
                 if (otherImp == null) continue;
 
-                // Ignoriere Imps die sich nicht bewegen oder arbeiten
                 if (otherImp.isTaskRotating || otherImp.agent.velocity.sqrMagnitude < 0.05f)
                     continue;
 
                 Vector3 directionAway = (transform.position - collider.transform.position).normalized;
                 float distance = Vector3.Distance(transform.position, collider.transform.position);
 
-                // Sanftere Ausweichkraft
                 float strength = Mathf.Clamp01((1f - (distance / (avoidanceRadius * 0.8f))) * 0.5f);
                 avoidanceDirection += directionAway * strength;
                 impCount++;
@@ -434,11 +885,9 @@ namespace DK
             {
                 avoidanceDirection = avoidanceDirection.normalized;
 
-                // Nur sehr sanfte Korrekturen
                 if (!isTaskRotating && !(currentTask != null && HasTrulyArrived()))
                 {
-                    // Weniger aggressive Ausweichmanöver
-                    if (Random.value < 0.3f) // Nur 30% Chance für Ausweichmanöver
+                    if (Random.value < 0.3f)
                     {
                         TryGentleAvoidance(avoidanceDirection);
                     }
@@ -455,22 +904,17 @@ namespace DK
             Vector3 currentDestination = agent.destination;
             Vector3 currentPos = transform.position;
 
-            // Sehr sanfte seitliche Korrektur
             Vector3 moveDirection = (currentDestination - currentPos).normalized;
             Vector3 rightDirection = Vector3.Cross(Vector3.up, moveDirection);
 
             float dotRight = Vector3.Dot(avoidanceDirection, rightDirection);
             Vector3 sideDirection = dotRight > 0 ? rightDirection : -rightDirection;
 
-            // Kleinere Ausweichkorrektur
             Vector3 avoidancePoint = currentPos + sideDirection * 0.8f + moveDirection * 0.3f;
 
             if (UnityEngine.AI.NavMesh.SamplePosition(avoidancePoint, out UnityEngine.AI.NavMeshHit hit, 1.5f, UnityEngine.AI.NavMesh.AllAreas))
             {
-                // Sanfte Richtungskorrektur ohne Coroutine
                 agent.SetDestination(hit.position);
-
-                // Nach kurzer Zeit zurück zum ursprünglichen Ziel
                 StartCoroutine(ReturnToOriginalDestination(currentDestination, 0.8f));
             }
         }
@@ -492,28 +936,22 @@ namespace DK
             Vector3 currentDestination = agent.destination;
             Vector3 currentPos = transform.position;
 
-            // Berechne seitliche Ausweichrichtung
             Vector3 moveDirection = (currentDestination - currentPos).normalized;
             Vector3 rightDirection = Vector3.Cross(Vector3.up, moveDirection);
 
-            // Wähle die Seite, die mehr in Richtung der Ausweichrichtung zeigt
             float dotRight = Vector3.Dot(avoidanceDirection, rightDirection);
             Vector3 sideDirection = dotRight > 0 ? rightDirection : -rightDirection;
 
-            // Berechne Ausweichpunkt
             Vector3 avoidancePoint = currentPos + sideDirection * 1.5f + moveDirection * 0.5f;
 
-            // Prüfe ob Ausweichpunkt auf NavMesh ist
             if (UnityEngine.AI.NavMesh.SamplePosition(avoidancePoint, out UnityEngine.AI.NavMeshHit hit, 2f, UnityEngine.AI.NavMesh.AllAreas))
             {
-                // Temporär zum Ausweichpunkt navigieren, dann zum ursprünglichen Ziel zurück
                 StartCoroutine(AvoidanceCoroutine(hit.position, currentDestination));
             }
         }
 
         void ApplyGentlePush(Vector3 pushDirection)
         {
-            // Sanftes Wegschubsen für Imps die an fester Position arbeiten
             Vector3 pushPosition = transform.position + pushDirection * 0.3f;
 
             if (UnityEngine.AI.NavMesh.SamplePosition(pushPosition, out UnityEngine.AI.NavMeshHit hit, 1f, UnityEngine.AI.NavMesh.AllAreas))
@@ -524,31 +962,25 @@ namespace DK
 
         System.Collections.IEnumerator AvoidanceCoroutine(Vector3 avoidancePoint, Vector3 originalDestination)
         {
-            // Zum Ausweichpunkt navigieren
             agent.SetDestination(avoidancePoint);
 
-            // Warten bis Ausweichpunkt erreicht
             while (!HasTrulyArrived() && Vector3.Distance(transform.position, avoidancePoint) > 1f)
             {
                 yield return null;
             }
 
-            // Kurz warten
             yield return new WaitForSeconds(0.2f);
 
-            // Zurück zum ursprünglichen Ziel
             agent.SetDestination(originalDestination);
         }
 
         void HandleRotation()
         {
-            // Mesh-Rotation korrigieren falls durch Kollision verfälscht
             if (meshTransform != null)
             {
                 meshTransform.localRotation = originalMeshRotation;
             }
 
-            // NEUE ZEILE: Task-spezifische Rotation hat ABSOLUTE Priorität
             if (isTaskRotating && targetLookDirection.HasValue)
             {
                 Vector3 direction = targetLookDirection.Value;
@@ -574,10 +1006,8 @@ namespace DK
                     isTaskRotating = false;
                 }
 
-                return; // WICHTIG: Verhindert normale Bewegungs-Rotation
+                return;
             }
-
-            // Normale Bewegungs-Rotation nur wenn KEINE Task-Rotation aktiv ist
             else if (agent.velocity.sqrMagnitude > 0.1f)
             {
                 Vector3 direction = agent.velocity.normalized;
@@ -597,17 +1027,32 @@ namespace DK
             currentTask.OnEnter(this);
         }
 
-        // In UnitAI.cs überschreibe die EnqueueTask Methode:
         public void EnqueueTask(ITask task, TaskPriority priority)
         {
-            // SICHERHEITSPRÜFUNG: Verhindere Task-Assignment während aktueller Task-Ausführung
-            if (currentTask != null)
+            // NEUE LOGIK: Unterbreche Wandern/Idle für wichtige Tasks
+            if (currentTask is WanderTask || currentTask is IdleTask)
+            {
+                if (priority == TaskPriority.High || priority == TaskPriority.Normal)
+                {
+                    Debug.Log($"[{name}] Unterbreche {currentTask.GetType().Name} für {task.GetType().Name}");
+                    currentTask.OnExit(this);
+                    currentTask = null;
+
+                    // Stoppe Wanderverhalten
+                    if (currentTask is WanderTask)
+                    {
+                        StopWandering();
+                    }
+                }
+            }
+
+            // SICHERHEITSPRÜFUNG: Verhindere Task-Assignment während wichtiger Tasks
+            if (currentTask != null && !(currentTask is IdleTask) && !(currentTask is WanderTask))
             {
                 Debug.LogWarning($"[{name}] Task-Assignment verweigert - bereits beschäftigt mit: {currentTask.GetType().Name}");
                 return;
             }
 
-            // Original-Logik
             switch (priority)
             {
                 case TaskPriority.High:
@@ -625,18 +1070,14 @@ namespace DK
         public bool IsAtDestination()
             => !agent.pathPending && agent.remainingDistance <= stoppingThreshold && agent.velocity.sqrMagnitude == 0f;
 
-        // In UnitAI.cs - erweitere die MoveTo Methode:
-        // In UnitAI.cs - erweitere die MoveTo Methode:
         public void MoveTo(Vector3 worldPosition)
         {
             if (agent == null) return;
 
-            // NEUE VALIDIERUNG: Prüfe NavMesh-Status
             if (!agent.isOnNavMesh)
             {
                 Debug.LogWarning($"[{name}] Agent ist nicht auf NavMesh! Position: {transform.position}");
 
-                // Versuche Agent auf NavMesh zu repositionieren
                 UnityEngine.AI.NavMeshHit hit;
                 if (UnityEngine.AI.NavMesh.SamplePosition(transform.position, out hit, 2.0f, UnityEngine.AI.NavMesh.AllAreas))
                 {
@@ -650,7 +1091,6 @@ namespace DK
                 }
             }
 
-            // ROBUSTERE Destination-Setzung
             if (agent.isActiveAndEnabled && agent.isOnNavMesh)
             {
                 agent.SetDestination(worldPosition);
@@ -662,7 +1102,6 @@ namespace DK
             }
         }
 
-        // NEUE METHODE: NavMesh-Status prüfen
         public bool IsNavMeshHealthy()
         {
             return agent != null &&
@@ -672,7 +1111,10 @@ namespace DK
         }
 
         public bool IsAvailable()
-            => currentTask == null;
+        {
+            // Für echte Arbeit: Imp muss komplett frei sein oder nur wandern/idlen
+            return currentTask == null || currentTask is IdleTask || currentTask is WanderTask;
+        }
 
         public void ForceAssignNewJobImmediately()
         {
@@ -692,52 +1134,35 @@ namespace DK
 
         void LateUpdate()
         {
-            // LateUpdate stellt sicher, dass Mesh-Korrekturen nach allen anderen Updates passieren
             if (meshTransform != null)
             {
-                // Mesh-Rotation komplett zurücksetzen
                 meshTransform.localRotation = originalMeshRotation;
-                meshTransform.localPosition = Vector3.zero; // Falls auch Position verfälscht wird
+                meshTransform.localPosition = Vector3.zero;
             }
         }
 
-        /// <summary>
-        /// Lässt den Imp in eine bestimmte Richtung schauen (für Tasks wie Digging)
-        /// </summary>
-        /// <param name="direction">Die Richtung, in die geschaut werden soll</param>
         public void LookAtDirection(Vector3 direction)
         {
             targetLookDirection = direction.normalized;
             isTaskRotating = true;
         }
 
-        /// <summary>
-        /// Lässt den Imp zu einem bestimmten Punkt schauen (für Tasks wie Digging)
-        /// </summary>
-        /// <param name="targetPoint">Der Punkt, zu dem geschaut werden soll</param>
         public void LookAtPoint(Vector3 targetPoint)
         {
             Vector3 direction = (targetPoint - transform.position).normalized;
             LookAtDirection(direction);
         }
 
-        /// <summary>
-        /// Stoppt die Task-spezifische Rotation
-        /// </summary>
         public void StopTaskRotation()
         {
             isTaskRotating = false;
             targetLookDirection = null;
         }
 
-        /// <summary>
-        /// Prüft ob der Imp korrekt ausgerichtet ist
-        /// </summary>
-        /// <returns>True wenn die Rotation abgeschlossen ist</returns>
         public bool IsCorrectlyOriented()
         {
             bool result = !isTaskRotating;
-            if (Time.frameCount % 30 == 0) // Nur alle halbe Sekunde debuggen
+            if (Time.frameCount % 30 == 0)
             {
                 Debug.Log($"[{name}] IsCorrectlyOriented: isTaskRotating = {isTaskRotating}, Ergebnis = {result}");
             }
@@ -762,7 +1187,6 @@ namespace DK
                 }
             }
 
-            // Debug nur gelegentlich um Spam zu vermeiden
             if (Time.frameCount % 60 == 0)
             {
                 Debug.Log($"[{name}] HasTrulyArrived: {result} " +
@@ -772,7 +1196,172 @@ namespace DK
 
             return result;
         }
+
+        // Neue Methoden für Wanderverhalten
+        public bool IsWandering()
+        {
+            return currentTask is WanderTask || isWandering;
+        }
+
+        public bool IsAvailableForWork()
+        {
+            return currentTask == null || currentTask is IdleTask || currentTask is WanderTask;
+        }
+
+        public void SetWanderHome(Vector3 newHomePosition)
+        {
+            homePosition = newHomePosition;
+        }
+
+        public void SetWanderBehaviorEnabled(bool enabled)
+        {
+            enableWanderBehavior = enabled;
+            if (!enabled)
+            {
+                StopWandering();
+            }
+        }
+
+        public void ForceStopWandering()
+        {
+            if (isWandering)
+            {
+                StopWandering();
+                ClearTasks(); // Entferne alle Low-Priority Tasks
+            }
+        }
+
+        public bool IsCurrentlyWandering => isWandering;
+
+        void OnDrawGizmosSelected()
+        {
+            if (!showDebugGizmos)
+                return;
+
+            // Zeichne Heimatposition
+            Gizmos.color = Color.green;
+            Gizmos.DrawWireSphere(homePosition, 0.5f);
+
+            // Zeichne Wander-Radius
+            Gizmos.color = Color.yellow;
+            Gizmos.DrawWireSphere(homePosition, maxWanderDistance);
+
+            // Zeichne aktuelles Wanderziel
+            if (currentWanderTarget.HasValue)
+            {
+                Gizmos.color = Color.red;
+                Gizmos.DrawWireSphere(currentWanderTarget.Value, 0.3f);
+                Gizmos.DrawLine(transform.position, currentWanderTarget.Value);
+            }
+        }
+        public string GetRandomIdleAnimation(string currentAnimation = "")
+        {
+            if (availableIdleAnimations == null || availableIdleAnimations.Length == 0)
+                return "Idle1";
+
+            // Gewichtete Auswahl
+            if (animationWeights != null && animationWeights.Length == availableIdleAnimations.Length)
+            {
+                return GetWeightedRandomAnimation(currentAnimation);
+            }
+
+            // Einfache zufällige Auswahl
+            int randomIndex;
+            do
+            {
+                randomIndex = Random.Range(0, availableIdleAnimations.Length);
+            }
+            while (preventSameAnimationTwice &&
+                   availableIdleAnimations.Length > 1 &&
+                   availableIdleAnimations[randomIndex] == currentAnimation);
+
+            return availableIdleAnimations[randomIndex];
+        }
+
+        private string GetWeightedRandomAnimation(string currentAnimation)
+        {
+            float totalWeight = 0f;
+
+            // Berechne Gesamtgewicht
+            for (int i = 0; i < animationWeights.Length; i++)
+            {
+                if (!preventSameAnimationTwice || availableIdleAnimations[i] != currentAnimation)
+                {
+                    totalWeight += animationWeights[i];
+                }
+            }
+
+            float randomValue = Random.Range(0f, totalWeight);
+            float currentWeight = 0f;
+
+            // Wähle basierend auf Gewichtung
+            for (int i = 0; i < availableIdleAnimations.Length; i++)
+            {
+                if (preventSameAnimationTwice && availableIdleAnimations[i] == currentAnimation)
+                    continue;
+
+                currentWeight += animationWeights[i];
+                if (randomValue <= currentWeight)
+                {
+                    return availableIdleAnimations[i];
+                }
+            }
+
+            // Fallback
+            return availableIdleAnimations[0];
+        }
+
+        /// <summary>
+        /// Prüft ob eine bestimmte Animation im Animator verfügbar ist
+        /// </summary>
+        public bool HasIdleAnimation(string animationName)
+        {
+            if (animator == null || animator.runtimeAnimatorController == null)
+                return false;
+
+            foreach (AnimatorControllerParameter param in animator.parameters)
+            {
+                if (param.name == animationName &&
+                    (param.type == AnimatorControllerParameterType.Trigger ||
+                     param.type == AnimatorControllerParameterType.Bool))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Gibt die Zeit für den nächsten Animationswechsel zurück
+        /// </summary>
+        public float GetRandomAnimationSwitchTime()
+        {
+            return Random.Range(minAnimationSwitchTime, maxAnimationSwitchTime);
+        }
+
+        /// <summary>
+        /// Erstellt eine einfache IdleTask mit den konfigurierten Einstellungen
+        /// </summary>
+        public IdleTask CreateConfiguredIdleTask(float duration)
+        {
+            var idleTask = new IdleTask(duration);
+
+            // Übergebe Konfiguration an den Task (falls erweitert)
+            if (debugIdleAnimations)
+            {
+                Debug.Log($"[{name}] Erstelle IdleTask mit {availableIdleAnimations.Length} verfügbaren Animationen");
+            }
+
+            return idleTask;
+        }
+
+
+
     }
 
     public enum TaskPriority { High, Normal, Low }
+
+
+
+
 }

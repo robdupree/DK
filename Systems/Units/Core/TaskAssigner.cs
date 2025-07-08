@@ -2,6 +2,7 @@
 using System.Linq;
 using UnityEngine;
 using DK.Tasks;
+using System.Reflection;
 
 namespace DK
 {
@@ -9,10 +10,10 @@ namespace DK
     {
         [Header("Performance Settings")]
         [Tooltip("Maximale Anzahl Task-Zuweisungen pro Frame")]
-        public int maxAssignmentsPerFrame = 5; // ERHÖHT für sofortige Reaktion
+        public int maxAssignmentsPerFrame = 5;
 
         [Tooltip("Frames zwischen Task-Assignment-Zyklen")]
-        public int framesBetweenAssignments = 1; // SOFORT für minimale Verzögerung
+        public int framesBetweenAssignments = 1;
 
         [Header("Debug Settings")]
         public bool enableDetailedLogging = false;
@@ -38,6 +39,10 @@ namespace DK
         // Anti-Spam für Logs
         private Dictionary<string, float> lastLogTime = new Dictionary<string, float>();
         private const float LOG_COOLDOWN = 5f;
+
+        // Task Assignment Protection
+        private Dictionary<UnitAI, float> lastTaskAssignmentTime = new Dictionary<UnitAI, float>();
+        private const float TASK_ASSIGNMENT_COOLDOWN = 2.0f;
 
         void Update()
         {
@@ -73,7 +78,6 @@ namespace DK
             var allImps = Object.FindObjectsByType<UnitAI>(FindObjectsSortMode.None);
             foreach (var imp in allImps)
             {
-                // WICHTIGE ÄNDERUNG: Nur wirklich verfügbare Imps ohne aktuelle Tasks
                 if (imp != null && imp.IsAvailable() && !IsImpCurrentlyWorking(imp))
                 {
                     cachedAvailableImps.Add(imp);
@@ -83,31 +87,72 @@ namespace DK
             lastImpCacheUpdate = Time.time;
         }
 
-        /// <summary>
-        /// NEUE METHODE: Prüft ob ein Imp gerade an einem Task arbeitet
-        /// </summary>
         bool IsImpCurrentlyWorking(UnitAI imp)
         {
-            // EINFACHE PRÜFUNG: Verwende nur IsAvailable() - das ist sicherer
-            // IsAvailable() prüft bereits alle internen Zustände
+            // ANGEPASST: Berücksichtige Wanderverhalten
             if (!imp.IsAvailable())
             {
-                return true; // Imp ist beschäftigt
+                // Prüfe ob es sich um einen unterbrechbaren Task handelt
+                var currentTaskField = typeof(UnitAI).GetField("currentTask",
+                    BindingFlags.NonPublic | BindingFlags.Instance);
+
+                if (currentTaskField != null)
+                {
+                    var currentTask = currentTaskField.GetValue(imp);
+                    if (currentTask != null)
+                    {
+                        string taskName = currentTask.GetType().Name;
+                        // Wandern und Idle Tasks sind unterbrechbar
+                        if (taskName == "WanderTask" || taskName == "IdleTask")
+                        {
+                            return false; // Imp ist verfügbar für wichtige Tasks
+                        }
+                    }
+                }
+
+                return true; // Imp ist mit wichtiger Task beschäftigt
             }
 
-            // ZUSÄTZLICH: Prüfe NavMeshAgent-Status wenn verfügbar
+            // ZUSÄTZLICH: Prüfe NavMeshAgent-Bewegung
             var navAgent = imp.GetComponent<UnityEngine.AI.NavMeshAgent>();
-            if (navAgent != null && navAgent.hasPath && navAgent.velocity.magnitude > 0.1f)
+            if (navAgent != null)
             {
-                return true; // Imp bewegt sich gerade zu einem Ziel
+                // Imp bewegt sich gerade zu einem Ziel
+                if (navAgent.hasPath && navAgent.velocity.magnitude > 0.05f)
+                {
+                    return true;
+                }
+
+                // Imp hat ein Ziel gesetzt und bewegt sich (auch bei geringer Geschwindigkeit)
+                if (navAgent.hasPath && !navAgent.isStopped && navAgent.remainingDistance > 0.1f)
+                {
+                    return true;
+                }
             }
 
-            return false; // Imp ist wirklich verfügbar
+            // ZUSÄTZLICH: Prüfe ob der Imp kürzlich einen Task erhalten hat
+            if (HasRecentTaskAssignment(imp))
+            {
+                return true;
+            }
+
+            return false; // Imp ist verfügbar
         }
 
-        /// <summary>
-        /// VERBESSERTE Imp-Priorisierung: Priorisiere Imps nach Nähe zu Tasks
-        /// </summary>
+        bool HasRecentTaskAssignment(UnitAI imp)
+        {
+            if (lastTaskAssignmentTime.TryGetValue(imp, out var lastTime))
+            {
+                return (Time.time - lastTime) < TASK_ASSIGNMENT_COOLDOWN;
+            }
+            return false;
+        }
+
+        void RecordTaskAssignment(UnitAI imp)
+        {
+            lastTaskAssignmentTime[imp] = Time.time;
+        }
+
         void BuildPrioritizedImpQueue()
         {
             impProcessingQueue.Clear();
@@ -117,20 +162,20 @@ namespace DK
 
             var validImps = cachedAvailableImps
                 .Where(imp => imp != null && imp.IsAvailable() && !IsImpCurrentlyWorking(imp))
-                .Take(15) // ERWEITERT: 15 statt 10 für bessere Abdeckung
+                .Take(15)
                 .ToList();
 
             if (validImps.Count == 0)
                 return;
 
-            // NEUE PRIORISIERUNG: Sortiere Imps nach ihrer Nähe zum nähesten Task
+            // NEUE PRIORISIERUNG: Sortiere Imps nach Wanderstatus und Nähe
             var prioritizedImps = validImps
-                .Select(imp => new ImpTaskDistance(imp))
-                .Where(itd => itd.DistanceToNearestTask < float.MaxValue)
-                .OrderBy(itd => itd.DistanceToNearestTask) // NÄHESTE IMPS ZUERST
-                .ThenBy(itd => itd.Age) // Bei gleicher Distanz: Ältere Imps zuerst
-                .Take(maxAssignmentsPerFrame * 3) // Mehr Kandidaten für bessere Auswahl
-                .Select(itd => itd.Imp)
+                .Select(imp => new ImpPriorityInfo(imp))
+                .OrderBy(info => info.IsWandering ? 1 : 0) // Nicht-wandernde Imps zuerst
+                .ThenBy(info => info.DistanceToNearestTask) // Dann nach Distanz
+                .ThenBy(info => info.Age) // Bei gleicher Distanz: Ältere Imps zuerst
+                .Take(maxAssignmentsPerFrame * 3)
+                .Select(info => info.Imp)
                 .ToList();
 
             foreach (var imp in prioritizedImps)
@@ -140,7 +185,7 @@ namespace DK
 
             isProcessingQueue = true;
 
-            LogWithCooldown("queue_built", $"[TaskAssigner] {prioritizedImps.Count} Imps eingereiht (näheste zuerst)");
+            LogWithCooldown("queue_built", $"[TaskAssigner] {prioritizedImps.Count} Imps eingereiht (nicht-wandernde bevorzugt)");
         }
 
         void ProcessImpQueue()
@@ -167,12 +212,8 @@ namespace DK
             }
         }
 
-        /// <summary>
-        /// VERBESSERTE Task-Assignment: Keine Unterbrechungen
-        /// </summary>
         bool TryAssignTaskToImp(UnitAI ai)
         {
-            // ZUSÄTZLICHE SICHERHEITSPRÜFUNG: Imp wirklich verfügbar?
             if (!ai.IsAvailable() || IsImpCurrentlyWorking(ai))
             {
                 Debug.Log($"[TaskAssigner] {ai.name} ist beschäftigt - überspringe Assignment");
@@ -193,7 +234,6 @@ namespace DK
 
             var digType = DigManager.Instance.digTaskType;
 
-            // NEUE LOGIK: Finde den NÄHESTEN verfügbaren Dig-Task für diesen spezifischen Imp
             var availableDigTasks = openTasks
                 .Where(t => t.type == digType)
                 .Where(t => IsDigTaskValidAndAvailable(t))
@@ -202,20 +242,17 @@ namespace DK
                     Distance = Vector3.Distance(impPosition, new Vector3(t.location.x, 0, t.location.y)),
                     Position = new Vector3Int(t.location.x, t.location.y, 0)
                 })
-                .OrderBy(x => x.Distance) // NÄHESTER TASK ZUERST
+                .OrderBy(x => x.Distance)
                 .ToList();
 
             if (availableDigTasks.Any())
             {
-                // ZUSÄTZLICHE PRÜFUNG: Wähle den Task mit den besten Slot-Chancen
-                foreach (var taskInfo in availableDigTasks.Take(3)) // Prüfe nur die 3 nähesten
+                foreach (var taskInfo in availableDigTasks.Take(3))
                 {
                     if (DigManager.Instance.tileMap.TryGetValue(taskInfo.Position, out var data))
                     {
-                        // Teste ob der Imp tatsächlich einen Slot für diesen Task bekommen kann
                         if (data.TryReserveBestSlot(impPosition, out var testDir, out var testWorldPos))
                         {
-                            // Slot verfügbar - gib ihn sofort wieder frei für echte Zuweisung
                             data.ReleaseSlot(testDir);
                             taskToAssign = taskInfo.Task;
 
@@ -231,7 +268,6 @@ namespace DK
                     }
                 }
 
-                // Fallback: Wenn kein Task mit verfügbaren Slots, nimm den nähesten
                 if (taskToAssign == null && availableDigTasks.Any())
                 {
                     taskToAssign = availableDigTasks.First().Task;
@@ -240,7 +276,6 @@ namespace DK
             }
             else
             {
-                // Fallback: Andere Tasks
                 taskToAssign = openTasks
                     .Where(t => t.type != digType)
                     .Where(t => IsTaskLocationValid(t.location))
@@ -257,14 +292,12 @@ namespace DK
                 return false;
             }
 
-            // FINALE SICHERHEITSPRÜFUNG vor Task-Zuweisung
             if (!ai.IsAvailable() || IsImpCurrentlyWorking(ai))
             {
                 Debug.LogWarning($"[TaskAssigner] {ai.name} wurde während Assignment beschäftigt - Task-Zuweisung abgebrochen");
                 return false;
             }
 
-            // SOFORTIGE Task-Zuweisung
             taskToAssign.isAssigned = true;
             TrackTaskAssignmentAtomic(taskToAssign);
 
@@ -273,10 +306,12 @@ namespace DK
             {
                 ai.EnqueueTask(concrete, TaskPriority.Normal);
 
+                RecordTaskAssignment(ai);
+
                 if (enableDetailedLogging)
                 {
                     var distance = Vector3.Distance(impPosition, new Vector3(taskToAssign.location.x, 0, taskToAssign.location.y));
-                    Debug.Log($"[TaskAssigner] ✅ ASSIGNED: {taskToAssign.type.taskName} at {taskToAssign.location} → {ai.name} (Dist: {distance:F1}m)");
+                    Debug.Log($"[TaskAssigner] ✅ ASSIGNED: {taskToAssign.type.taskName} at {taskToAssign.location} → {ai.name} (Dist: {distance:F1}m, Protected for {TASK_ASSIGNMENT_COOLDOWN}s)");
                 }
 
                 return true;
@@ -293,19 +328,17 @@ namespace DK
         {
             var pos = new Vector3Int(task.location.x, task.location.y, 0);
 
-            // NEUE VALIDIERUNG: Prüfe ob Position überhaupt existiert
             if (!DigManager.Instance.tileMap.TryGetValue(pos, out var data))
             {
                 Debug.LogWarning($"[TaskAssigner] Task {task.location} verweist auf nicht-existierende Position");
-                task.isCompleted = true; // Markiere als completed
+                task.isCompleted = true;
                 return false;
             }
 
-            // NEUE VALIDIERUNG: Prüfe State genauer
             if (data.State != TileState.Wall_Marked && data.State != TileState.Wall_BeingDug)
             {
                 Debug.LogWarning($"[TaskAssigner] Task {task.location} verweist auf Tile mit falschem State: {data.State}");
-                task.isCompleted = true; // Markiere als completed
+                task.isCompleted = true;
                 return false;
             }
 
@@ -325,7 +358,6 @@ namespace DK
                 return false;
             }
 
-            // Vereinfachte Slot-Validierung
             bool hasBasicSlotAvailability = HasBasicWorkerSlots(task.location, data);
 
             return hasBasicSlotAvailability;
@@ -339,7 +371,6 @@ namespace DK
             var pendingWorkers = GetPendingWorkersForTile(tileLocation);
             var totalWorkers = activeWorkers + pendingWorkers;
 
-            // GROSSZÜGIGERE Grenze: Mehr Spielraum für gleichzeitige Zuweisungen
             return totalWorkers < (maxWorkers - 1);
         }
 
@@ -464,9 +495,9 @@ namespace DK
         {
             if (!showPerformanceGUI) return;
 
-            GUILayout.BeginArea(new Rect(10, 10, 400, 300));
+            GUILayout.BeginArea(new Rect(10, 10, 400, 350));
 
-            GUILayout.Label("=== TaskAssigner Monitor (Keine Unterbrechungen) ===", GUI.skin.box);
+            GUILayout.Label("=== TaskAssigner Monitor (Mit Wanderverhalten) ===", GUI.skin.box);
             GUILayout.Label($"Queue: {impProcessingQueue.Count}");
             GUILayout.Label($"Tracked Tiles: {tileTaskTracking.Count}");
             GUILayout.Label($"Processing: {isProcessingQueue}");
@@ -479,7 +510,12 @@ namespace DK
             var availableImps = cachedAvailableImps.Count;
             var busyImps = allImps.Length - availableImps;
 
+            // NEUE WANDERSTATISTIKEN
+            var wanderingImps = allImps.Where(imp => imp.IsWandering()).Count();
+            var idleImps = allImps.Where(imp => imp.IsAvailable() && !imp.IsWandering()).Count();
+
             GUILayout.Label($"Imps: {allImps.Length} total ({availableImps} available, {busyImps} busy)");
+            GUILayout.Label($"Wandering: {wanderingImps}, Idle: {idleImps}");
 
             // Zeige Dig-Task-Statistiken
             var allTasks = TaskManager.Instance.openTasks;
@@ -489,9 +525,11 @@ namespace DK
 
             GUILayout.Label($"Tasks: {allTasks.Count} total ({digTasks} dig, {assignedTasks} assigned, {completedTasks} completed)");
 
-            // Zeige Working-Status
+            // Zeige Working-Status mit Details
             var workingImps = allImps.Where(imp => IsImpCurrentlyWorking(imp)).Count();
+            var protectedImps = allImps.Where(imp => HasRecentTaskAssignment(imp)).Count();
             GUILayout.Label($"Working Imps: {workingImps} (protected from interruption)");
+            GUILayout.Label($"Recently Assigned: {protectedImps} (cooldown: {TASK_ASSIGNMENT_COOLDOWN}s)");
 
             GUILayout.BeginHorizontal();
             GUILayout.Label($"Assignments/Frame: {maxAssignmentsPerFrame}");
@@ -510,19 +548,28 @@ namespace DK
             GUILayout.EndArea();
         }
 
-        /// <summary>
-        /// Triggert sofortige Task-Zuweisung für neu verfügbare Tasks
-        /// </summary>
         public void TriggerImmediateAssignment()
         {
-            Debug.Log("[TaskAssigner] Sofortige Task-Zuweisung getriggert (Keine Unterbrechungen)");
+            Debug.Log("[TaskAssigner] Sofortige Task-Zuweisung getriggert (Mit Wanderverhalten)");
 
             UpdateAvailableImpsCache();
+
+            var allImps = Object.FindObjectsByType<UnitAI>(FindObjectsSortMode.None);
+            var protectedImps = allImps.Where(imp => IsImpCurrentlyWorking(imp)).Count();
+            var availableImps = cachedAvailableImps.Count;
+
+            Debug.Log($"[TaskAssigner] Von {allImps.Length} Imps sind {protectedImps} geschützt, {availableImps} verfügbar für neue Tasks");
+
+            if (cachedAvailableImps.Count == 0)
+            {
+                Debug.Log("[TaskAssigner] Keine verfügbaren Imps - überspringe Assignment");
+                return;
+            }
+
             impProcessingQueue.Clear();
             isProcessingQueue = false;
 
-            // AGGRESSIVERE Versuche für bessere Slot-Zuweisung
-            for (int attempt = 0; attempt < 5; attempt++)
+            for (int attempt = 0; attempt < 3; attempt++)
             {
                 if (cachedAvailableImps.Count > 0)
                 {
@@ -538,19 +585,16 @@ namespace DK
         }
 
         /// <summary>
-        /// NEUE HILFKLASSE: Berechnet Imp-zu-Task Distanzen nur für VERFÜGBARE Imps
+        /// NEUE HILFKLASSE: Erweiterte Imp-Prioritäts-Info
         /// </summary>
-        private class ImpTaskDistance
+        private class ImpPriorityInfo
         {
             public UnitAI Imp;
             public float DistanceToNearestTask;
             public float Age;
+            public bool IsWandering;
 
-            private static List<Task> cachedDigTasks = new List<Task>();
-            private static float lastDigTaskCacheUpdate = 0f;
-            private const float DIG_TASK_CACHE_INTERVAL = 0.5f;
-
-            public ImpTaskDistance(UnitAI imp)
+            public ImpPriorityInfo(UnitAI imp)
             {
                 Imp = imp;
 
@@ -561,52 +605,33 @@ namespace DK
                 }
                 Age = ageTracker.Age;
 
-                // NUR berechnen wenn Imp wirklich verfügbar ist
+                // Prüfe ob Imp gerade wandert
+                IsWandering = imp.IsWandering();
+
+                // Berechne Distanz nur wenn Imp verfügbar ist
                 if (imp.IsAvailable())
                 {
                     DistanceToNearestTask = CalculateDistanceToNearestDigTask(imp);
                 }
                 else
                 {
-                    DistanceToNearestTask = float.MaxValue; // Beschäftigte Imps haben "unendliche" Distanz
+                    DistanceToNearestTask = float.MaxValue;
                 }
             }
 
             float CalculateDistanceToNearestDigTask(UnitAI imp)
             {
-                // Cache nur Dig-Tasks für bessere Performance
-                if (Time.time - lastDigTaskCacheUpdate > DIG_TASK_CACHE_INTERVAL)
-                {
-                    cachedDigTasks.Clear();
-                    cachedDigTasks.AddRange(TaskManager.Instance.openTasks
-                        .Where(t => !t.isCompleted && !t.isAssigned && t.type == DigManager.Instance.digTaskType));
-                    lastDigTaskCacheUpdate = Time.time;
-                }
+                var openDigTasks = TaskManager.Instance.openTasks
+                    .Where(t => !t.isCompleted && !t.isAssigned && t.type == DigManager.Instance.digTaskType)
+                    .ToList();
 
-                if (!cachedDigTasks.Any())
+                if (!openDigTasks.Any())
                     return float.MaxValue;
 
                 var impPos = imp.transform.position;
-                float nearestDistance = float.MaxValue;
-
-                // Finde die 2 nähesten Dig-Tasks
-                var nearbyTasks = cachedDigTasks
-                    .OrderBy(t => Vector3.Distance(impPos, new Vector3(t.location.x, 0, t.location.y)))
-                    .Take(2)
-                    .ToList();
-
-                foreach (var task in nearbyTasks)
-                {
-                    var taskWorldPos = new Vector3(task.location.x, 0, task.location.y);
-                    float distance = Vector3.Distance(impPos, taskWorldPos);
-
-                    if (distance < nearestDistance)
-                    {
-                        nearestDistance = distance;
-                    }
-                }
-
-                return nearestDistance;
+                return openDigTasks
+                    .Select(t => Vector3.Distance(impPos, new Vector3(t.location.x, 0, t.location.y)))
+                    .Min();
             }
         }
 
